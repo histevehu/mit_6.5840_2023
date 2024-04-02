@@ -19,3 +19,9 @@
 
 # Go workspace file
 go.work
+
+pkg/
+api.key
+.api.key.trimmed
+*-handin.tar.gz
+.idea/
