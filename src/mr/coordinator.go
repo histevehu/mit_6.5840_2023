@@ -1,43 +1,66 @@
 package mr
 
 import (
-	"fmt"
 	"log"
 	"net"
 	"net/http"
 	"net/rpc"
 	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
 )
 
-type Coordinator struct {
-	State      int        // Map Reduce phase
-	MapChan    chan *Task // Map task channel
-	ReduceChan chan *Task // Reduce task channel
-	ReduceNum  int        // Reduce amount
-	Files      []string   // files
-}
+// ==================== Coordinator ====================
 
-type Task struct {
-	TaskType  int    // task status：Map, Reduce
-	FileName  string // file
-	TaskId    int    // task ID, used for temp files generation
-	ReduceNum int    // Reduce amount
+type Coordinator struct {
+	State       int                // coordinator state
+	MapChan     chan *TaskMetaInfo // Map task channel(used to distribute tasks)
+	ReduceChan  chan *TaskMetaInfo // Reduce task channel(used to distribute tasks)
+	ReduceNum   int                // Reduce amount
+	Files       []string           // files
+	taskMetaMap map[int]*TaskMetaInfo
 }
 
 const (
-	TaskType_Map=iota
-	TaskType_Reduce
+	CoordinatorState_Initial  = 0
+	CoordinatorState_Mapping  = 1
+	CoordinatorState_Reducing = 2
+	CoordinatorState_Done     = 3
 )
 
-// Your code here -- RPC handlers for the worker to call.
+type TaskMetaInfo struct {
+	TaskAddr  *Task
+	State     int
+	BeginTime time.Time
+}
 
-// an example RPC handler.
-//
-// the RPC argument and reply types are defined in rpc.go.
-// func (c *Coordinator) Example(args *ExampleArgs, reply *ExampleReply) error {
-// 	reply.Y = args.X + 1
-// 	return nil
-// }
+type Task struct {
+	TaskType  int      // task status：Map, Reduce, waiting, done
+	FileNames []string // files
+	TaskId    int      // task ID, used for temp files generation
+	ReduceNum int      // Reduce amount
+}
+
+const (
+	TaskType_Map    = 0
+	TaskType_Reduce = 1
+	TaskType_Wait   = 2 // The task type returned when the coordinator is not in the done state but currently has no tasks to push
+	TaskType_Done   = 3 // The task type returned when the coordinator is in the done state
+)
+
+const (
+	TaskState_Working = 0
+	TaskState_Waiting = 1
+	TaskState_Done    = 2
+)
+
+var mu sync.Mutex
+
+const (
+	Timeout_Time = 10
+)
 
 // start a thread that listens for RPCs from worker.go
 func (c *Coordinator) server() {
@@ -56,15 +79,43 @@ func (c *Coordinator) server() {
 // main/mrcoordinator.go calls Done() periodically to find out
 // if the entire job has finished.
 func (c *Coordinator) Done() bool {
-	ret := false
-
-	// Your code here.
-
-	return ret
+	mu.Lock()
+	defer mu.Unlock()
+	return c.State == CoordinatorState_Done
 }
 
 func (c *Coordinator) PushTask(args *TaskArgs, reply *Task) error {
-	*reply = *<-c.MapChan
+	// Ensure thread safety through locking operations.
+	mu.Lock()
+	defer mu.Unlock()
+	// push corresponding tasks based on the coordinator's state
+	// instead of the worker querying the coordinator's state and processing accordingly
+	switch c.State {
+	case CoordinatorState_Mapping:
+		if len(c.MapChan) > 0 {
+			tmp := <-c.MapChan
+			tmp.State = TaskState_Working
+			tmp.BeginTime = time.Now()
+			*reply = *tmp.TaskAddr
+			// log.Printf("Map Task [ %d ] pushed. [ %d ] Map Task(s) left.\n", tmp.TaskAddr.TaskId, len(c.MapChan))
+		} else {
+			*reply = Task{TaskType: TaskType_Wait}
+		}
+	case CoordinatorState_Reducing:
+		if len(c.ReduceChan) > 0 {
+			tmp := <-c.ReduceChan
+			tmp.State = TaskState_Working
+			tmp.BeginTime = time.Now()
+			*reply = *tmp.TaskAddr
+		} else {
+			*reply = Task{TaskType: TaskType_Wait}
+		}
+
+	case CoordinatorState_Initial:
+		*reply = Task{TaskType: TaskType_Wait}
+	case CoordinatorState_Done:
+		*reply = Task{TaskType: TaskType_Done}
+	}
 	return nil
 }
 
@@ -72,13 +123,15 @@ func (c *Coordinator) PushTask(args *TaskArgs, reply *Task) error {
 // main/mrcoordinator.go calls this function.
 // nReduce is the number of reduce tasks to use.
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
-	c := Coordinator{State: 0,
-		MapChan:    make(chan *Task, len(files)),
-		ReduceChan: make(chan *Task, nReduce),
-		ReduceNum:  nReduce,
-		Files:      files}
+	c := Coordinator{State: CoordinatorState_Initial,
+		MapChan:     make(chan *TaskMetaInfo, len(files)),
+		ReduceChan:  make(chan *TaskMetaInfo, nReduce),
+		ReduceNum:   nReduce,
+		Files:       files,
+		taskMetaMap: make(map[int]*TaskMetaInfo)}
 	c.MakeMapTasks(files)
-
+	go c.CheckTimeOut()
+	c.ToNextState()
 	c.server()
 	return &c
 }
@@ -86,12 +139,120 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 func (c *Coordinator) MakeMapTasks(files []string) {
 	// Create a map reduce task for each file
 	for id, v := range files {
+		taskFiles := []string{v}
 		task := Task{TaskType: TaskType_Map,
-			FileName:  v,
+			FileNames: taskFiles,
 			TaskId:    id,
 			ReduceNum: c.ReduceNum}
-		c.MapChan <- &task
+		taskMetaInfo := TaskMetaInfo{
+			TaskAddr: &task,
+			State:    TaskState_Waiting,
+		}
+		c.taskMetaMap[id] = &taskMetaInfo
+		c.MapChan <- &taskMetaInfo
+	}
+	// print("Made ", len(files), " Map Tasks\n")
+}
 
-		fmt.Println("Made map task: ",v)
+// Generate a number of reduceNum Reduce tasks.
+func (c *Coordinator) makeReduceTasks() {
+	// Use all intermediate files generated by the i-th Map task as a Reduce task
+	for i := 0; i < c.ReduceNum; i++ {
+		id := i + len(c.Files)
+		task := Task{
+			TaskType:  TaskType_Reduce,
+			FileNames: selectReduceFiles(i),
+			TaskId:    id,
+		}
+		taskMetaInfo := TaskMetaInfo{
+			TaskAddr: &task,
+			State:    TaskState_Waiting}
+		c.taskMetaMap[id] = &taskMetaInfo
+		c.ReduceChan <- &taskMetaInfo
+	}
+	// print("Made ", c.ReduceNum, " Map Tasks\n")
+}
+
+func (c *Coordinator) MarkTaskDone(args *Task, reply *Task) error {
+	mu.Lock()
+	defer mu.Unlock()
+	meta, ok := c.taskMetaMap[args.TaskId]
+	if ok {
+		switch meta.State {
+		case TaskState_Working:
+			meta.State = TaskState_Done
+			if c.checkAllTasks() {
+				c.ToNextState()
+				// log.Println("Coordinator state set to ",c.State)
+			}
+		case TaskState_Waiting:
+			// log.Printf("Task[ %d ] is timed out and has been reassigned\n", args.TaskId)
+		case TaskState_Done:
+			// log.Printf("Task[ %d ] is finished already\n", args.TaskId)
+		}
+	}
+	return nil
+}
+
+// return the names of all intermediate temporary files in the current directory
+func selectReduceFiles(reduceNum int) []string {
+	s := []string{}
+	path, _ := os.Getwd()
+	files, _ := os.ReadDir(path)
+	for _, f := range files {
+		if strings.HasPrefix(f.Name(), "mr-tmp-") && strings.HasSuffix(f.Name(), strconv.Itoa(reduceNum)) {
+			s = append(s, f.Name())
+		}
+	}
+	return s
+}
+
+// Change the state of the Coordinator to next state
+func (c *Coordinator) ToNextState() {
+	switch c.State {
+	case CoordinatorState_Initial:
+		c.State = CoordinatorState_Mapping
+	case CoordinatorState_Mapping:
+		c.makeReduceTasks()
+		c.State = CoordinatorState_Reducing
+	case CoordinatorState_Reducing:
+		c.State = CoordinatorState_Done
+	}
+}
+
+// For thread safety, it can only be called within locked code blocks.
+func (c *Coordinator) checkAllTasks() bool {
+	for _, v := range c.taskMetaMap {
+		if v.State != TaskState_Done {
+			return false
+		}
+	}
+	return true
+}
+
+func (c *Coordinator) CheckTimeOut() {
+	for {
+		// Check if the task times out every two seconds
+		time.Sleep(2 * time.Second)
+		mu.Lock()
+		// If the Coordinator state is already Done, end the check
+		if c.State == CoordinatorState_Done {
+			mu.Unlock()
+			break
+		}
+		// Treat a timeout task as crashed and reassign it
+		// set the task state and put it in the corresponding channel to be consumed again
+		for _, metaInfo := range c.taskMetaMap {
+			if metaInfo.State == TaskState_Working && time.Since(metaInfo.BeginTime) > Timeout_Time*time.Second {
+				// log.Printf("Task[ %d ] is crash,take [%f] secs\n", metaInfo.TaskAddr.TaskId, time.Since(metaInfo.BeginTime).Seconds())
+				metaInfo.State = TaskState_Waiting
+				if metaInfo.TaskAddr.TaskType == TaskType_Map {
+					c.MapChan <- metaInfo
+				} else if metaInfo.TaskAddr.TaskType == TaskType_Reduce {
+					c.ReduceChan <- metaInfo
+				}
+			}
+		}
+		mu.Unlock()
 	}
 }

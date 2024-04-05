@@ -8,7 +8,9 @@ import (
 	"log"
 	"net/rpc"
 	"os"
+	"sort"
 	"strconv"
+	"time"
 )
 
 // Map functions return a slice of KeyValue.
@@ -16,6 +18,14 @@ type KeyValue struct {
 	Key   string
 	Value string
 }
+
+// for sorting by key.
+type ByKey []KeyValue
+
+// for sorting by key.
+func (a ByKey) Len() int           { return len(a) }
+func (a ByKey) Swap(i, j int)      { a[i], a[j] = a[j], a[i] }
+func (a ByKey) Less(i, j int) bool { return a[i].Key < a[j].Key }
 
 // use ihash(key) % NReduce to choose the reduce
 // task number for each KeyValue emitted by Map.
@@ -27,36 +37,58 @@ func ihash(key string) int {
 
 // main/mrworker.go calls this function.
 func Worker(mapf func(string, string) []KeyValue, reducef func(string, []string) string) {
-	task := PullTask()
-	DoMapTask(&task, mapf)
+	alive := true
+	for alive {
+		task := PullTask()
+		switch task.TaskType {
+		case TaskType_Map:
+			{
+				DoMapTask(&task, mapf)
+				ReportTaskDone(&task)
+			}
+		case TaskType_Reduce:
+			{
+				DoReduceTask(&task, reducef)
+				ReportTaskDone(&task)
+			}
+		case TaskType_Wait:
+			{
+				// log.Println("All tasks are in progress, waiting...")
+				time.Sleep(time.Second)
+			}
+		case TaskType_Done:
+			{
+				// log.Println("All tasks are done, Worker exit")
+				alive = false
+			}
+		}
+	}
 }
 
 func PullTask() Task {
 	args := TaskArgs{}
 	reply := Task{}
 	if ok := call("Coordinator.PushTask", &args, &reply); ok {
-		fmt.Printf("reply TaskId is %d\n", reply.TaskId)
+		// log.Printf("reply TaskId is %d\n", reply.TaskId)
 	} else {
-		fmt.Printf("call failed!\n")
+		// log.Printf("call failed!\n")
 	}
 	return reply
 }
 
 func DoMapTask(task *Task, mapf func(string, string) []KeyValue) {
-	mapRes := []KeyValue{}
-	fmt.Println(task.FileName)
-	file, err := os.Open(task.FileName)
+	file, err := os.Open(task.FileNames[0])
 	if err != nil {
-		log.Fatalf("cannot open %v", task.FileName)
+		log.Fatalf("cannot open %v", task.FileNames)
 	}
 	content, err := io.ReadAll(file)
 	if err != nil {
-		log.Fatalf("cannot read %v", task.FileName)
+		log.Fatalf("cannot read %v", task.FileNames)
 	}
 	file.Close()
 	reduceNum := task.ReduceNum
 	// iterate through each word in the file and return the <word,1> pair
-	mapRes = mapf(task.FileName, string(content))
+	mapRes := mapf(task.FileNames[0], string(content))
 	// hash the word of map result and store it to the hash bucket with corresponding location through the hash value and reduce num
 	HashKv := make([][]KeyValue, reduceNum)
 	for _, v := range mapRes {
@@ -81,34 +113,62 @@ func DoMapTask(task *Task, mapf func(string, string) []KeyValue) {
 	}
 }
 
-//
-// example function to show how to make an RPC call to the coordinator.
-//
-// the RPC argument and reply types are defined in rpc.go.
-//
-/* func CallExample() {
-
-	// declare an argument structure.
-	args := ExampleArgs{}
-
-	// fill in the argument(s).
-	args.X = 99
-
-	// declare a reply structure.
-	reply := ExampleReply{}
-
-	// send the RPC request, wait for the reply.
-	// the "Coordinator.Example" tells the
-	// receiving server that we'd like to call
-	// the Example() method of struct Coordinator.
-	ok := call("Coordinator.Example", &args, &reply)
-	if ok {
-		// reply.Y should be 100.
-		fmt.Printf("reply.Y %v\n", reply.Y)
-	} else {
-		fmt.Printf("call failed!\n")
+func DoReduceTask(task *Task, reducef func(string, []string) string) {
+	reduceNum := task.TaskId
+	intermediate := shuffle(task.FileNames)
+	finalName := fmt.Sprintf("mr-out-%d", reduceNum)
+	ofile, err := os.Create(finalName)
+	if err != nil {
+		log.Fatal("create file failed:", err)
 	}
-} */
+	for i := 0; i < len(intermediate); {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		// The keys in the range i and j are the same
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+		i = j
+	}
+	ofile.Close()
+}
+
+// Read key-value pairs in all Map intermediate temp file and sort them by key
+func shuffle(files []string) []KeyValue {
+	kva := []KeyValue{}
+	for _, fi := range files {
+		file, err := os.Open(fi)
+		if err != nil {
+			log.Fatalf("cannot open %v", fi)
+		}
+		dec := json.NewDecoder(file)
+		for {
+			kv := KeyValue{}
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			kva = append(kva, kv)
+		}
+		file.Close()
+	}
+	sort.Sort(ByKey(kva))
+	return kva
+}
+
+func ReportTaskDone(task *Task) error {
+	args := task
+	reply := Task{}
+	ok := call("Coordinator.MarkTaskDone", &args, &reply)
+	if ok {
+		// log.Printf("Task [ %d ] done\n", task.TaskId)
+	}
+	return nil
+}
 
 // send an RPC request to the coordinator, wait for the response.
 // usually returns true.
@@ -127,6 +187,6 @@ func call(rpcname string, args interface{}, reply interface{}) bool {
 		return true
 	}
 
-	fmt.Println(err)
+	log.Println(err)
 	return false
 }
